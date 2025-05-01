@@ -1,10 +1,11 @@
 # coding=utf-8
-#
-# pump_atlas_ezo_pmp.py - Output for Atlas Scientific EZO Pump
-#
+# pump_atlas_ezo_pmp.py - Output for Atlas Scientific EZO Pump (Bluetooth Modified)
+
 import copy
 import datetime
 import threading
+import serial
+import time
 
 from flask_babel import lazy_gettext
 
@@ -36,7 +37,6 @@ channels_dict = {
     }
 }
 
-# Output information
 OUTPUT_INFORMATION = {
     'output_name_unique': 'atlas_ezo_pmp',
     'output_name': "{}: Atlas Scientific".format(lazy_gettext('Peristaltic Pump')),
@@ -66,13 +66,13 @@ OUTPUT_INFORMATION = {
         ('pip-pypi', 'pylibftdi', 'pylibftdi==0.20.0')
     ],
 
-    'interfaces': ['I2C', 'UART', 'FTDI'],
+    'interfaces': ['I2C', 'UART', 'FTDI', 'Bluetooth'],
     'i2c_location': ['0x67'],
     'i2c_address_editable': True,
     'ftdi_location': '/dev/ttyUSB0',
     'uart_location': '/dev/ttyAMA0',
     'uart_baud_rate': 9600,
-    
+
     'custom_channel_options': [
         {
             'id': 'flow_mode',
@@ -162,13 +162,12 @@ OUTPUT_INFORMATION = {
     ]
 }
 
-
 class OutputModule(AbstractOutput):
-    """An output support class that operates an output."""
     def __init__(self, output, testing=False):
         super().__init__(output, testing=testing, name=__name__)
 
         self.atlas_device = None
+        self.bt_serial = None
         self.currently_dispensing = False
         self.interface = None
 
@@ -180,7 +179,15 @@ class OutputModule(AbstractOutput):
     def initialize(self):
         self.setup_output_variables(OUTPUT_INFORMATION)
         self.interface = self.output.interface
-        self.atlas_device = setup_atlas_device(self.output)
+        if self.interface == 'Bluetooth':
+            try:
+                self.bt_serial = serial.Serial('COM3', baudrate=9600, timeout=1)
+                time.sleep(2)
+                self.logger.info("Bluetooth serial connection established.")
+            except Exception as e:
+                self.logger.exception("Failed to open Bluetooth serial connection: {}".format(e))
+        else:
+            self.atlas_device = setup_atlas_device(self.output)
         self.output_setup = True
 
     def record_dispersal(self, amount_ml=None, seconds_to_run=None):
@@ -193,14 +200,13 @@ class OutputModule(AbstractOutput):
 
     def output_switch(self, state, output_type=None, amount=None, output_channel=None):
         if not self.is_setup():
-            msg = "Error 101: Device not set up. See https://kizniche.github.io/Mycodo/Error-Codes#error-101 for more info."
+            msg = "Error 101: Device not set up."
             self.logger.error(msg)
             return msg
 
         if state == 'on' and output_type == 'sec':
             if self.currently_dispensing:
-                self.logger.debug(
-                    "Pump instructed to turn on while it's already dispensing.")
+                self.logger.debug("Pump already dispensing.")
             else:
                 self.currently_dispensing = True
                 write_cmd = "D,*"
@@ -215,29 +221,31 @@ class OutputModule(AbstractOutput):
             if self.options_channels['flow_mode'][0] == 'fastest_flow_rate':
                 minutes_to_run = abs(amount) / 105
                 seconds_to_run = minutes_to_run * 60
-                write_cmd = 'D,{ml:.2f}'.format(ml=amount)
+                write_cmd = 'D,{:.2f}'.format(amount)
             elif self.options_channels['flow_mode'][0] == 'specify_flow_rate':
                 minutes_to_run = abs(amount) / self.options_channels['flow_rate'][0]
                 seconds_to_run = minutes_to_run * 60
-                write_cmd = 'D,{ml:.2f},{min:.2f}'.format(
-                    ml=amount, min=minutes_to_run)
+                write_cmd = 'D,{:.2f},{:.2f}'.format(amount, minutes_to_run)
             else:
-                self.logger.error("Invalid output_mode: '{}'".format(
+                self.logger.error("Invalid flow_mode: '{}'".format(
                     self.options_channels['flow_mode'][0]))
                 return
 
         else:
-            self.logger.error(
-                "Invalid parameters: State: {state}, Type: {ot}, Mode: {mod}, Amount: {amt}, Flow Rate: {fr}".format(
-                    state=state,
-                    ot=output_type,
-                    mod=self.options_channels['flow_mode'][0],
-                    amt=amount,
-                    fr=self.options_channels['flow_rate'][0]))
+            self.logger.error("Invalid parameters for output_switch.")
             return
 
-        self.logger.debug("EZO-PMP command: {}".format(write_cmd))
-        self.atlas_device.query(write_cmd)
+        self.logger.debug("Command to send: {}".format(write_cmd))
+
+        try:
+            if self.interface == 'Bluetooth' and self.bt_serial:
+                self.bt_serial.write((write_cmd + '\r').encode())
+                response = self.bt_serial.readline()
+                self.logger.debug("Bluetooth response: {}".format(response.decode().strip()))
+            else:
+                self.atlas_device.query(write_cmd)
+        except Exception as e:
+            self.logger.exception("Command send failed: {}".format(e))
 
         if output_type == 'vol' and amount and seconds_to_run:
             self.record_dispersal(amount_ml=amount, seconds_to_run=seconds_to_run)
@@ -246,10 +254,8 @@ class OutputModule(AbstractOutput):
         if self.is_setup():
             if self.currently_dispensing:
                 return True
-
             device_measurements = db_retrieve_table_daemon(
-                DeviceMeasurements).filter(
-                DeviceMeasurements.device_id == self.unique_id)
+                DeviceMeasurements).filter(DeviceMeasurements.device_id == self.unique_id)
             for each_dev_meas in device_measurements:
                 if each_dev_meas.unit == 'minute':
                     last_measurement = read_influxdb_single(
@@ -262,8 +268,7 @@ class OutputModule(AbstractOutput):
                         datetime_ts = datetime.datetime.fromtimestamp(last_measurement[0])
                         minutes_on = last_measurement[1]
                         ts_pmp_off = datetime_ts + datetime.timedelta(minutes=minutes_on)
-                        is_on = bool(datetime.datetime.now() < ts_pmp_off)
-                        if is_on:
+                        if datetime.datetime.now() < ts_pmp_off:
                             return True
             return False
 
@@ -272,10 +277,17 @@ class OutputModule(AbstractOutput):
 
     def dispense_ml(self, args_dict):
         if 'dispense_volume_ml' not in args_dict:
-            self.logger.error("Cannot calibrate without volume (instructed)")
+            self.logger.error("Cannot calibrate without volume")
             return
         write_cmd = "D,{}".format(args_dict['dispense_volume_ml'])
-        self.logger.debug("Command returned: {}".format(self.atlas_device.query(write_cmd)))
+        self.logger.debug("Command: {}".format(write_cmd))
+        try:
+            if self.interface == 'Bluetooth' and self.bt_serial:
+                self.bt_serial.write((write_cmd + '\r').encode())
+            else:
+                self.atlas_device.query(write_cmd)
+        except Exception as e:
+            self.logger.exception("Dispense command failed: {}".format(e))
 
     def calibrate(self, level, ml):
         try:
@@ -284,33 +296,36 @@ class OutputModule(AbstractOutput):
             elif level == "calibrate_ml":
                 write_cmd = "Cal,{}".format(ml)
             else:
-                self.logger.error("Unknown option: {}".format(level))
+                self.logger.error("Unknown calibration level: {}".format(level))
                 return
-            self.logger.debug("Calibration command: {}".format(write_cmd))
-            self.logger.info("Command returned: {}".format(self.atlas_device.query(write_cmd)))
-            self.logger.info("Calibrated: {}".format(self.atlas_device.query("Cal,?")))
-        except:
-            self.logger.exception("Exception calibrating")
+            if self.interface == 'Bluetooth' and self.bt_serial:
+                self.bt_serial.write((write_cmd + '\r').encode())
+            else:
+                self.atlas_device.query(write_cmd)
+        except Exception as e:
+            self.logger.exception("Calibration failed: {}".format(e))
 
     def clear_calibrate(self, args_dict):
         self.calibrate('clear', None)
 
     def calibrate_ml(self, args_dict):
         if 'calibrate_volume_ml' not in args_dict:
-            self.logger.error("Cannot calibrate without volume (actual)")
+            self.logger.error("No volume given for calibration")
             return
         self.calibrate('calibrate_ml', args_dict['calibrate_volume_ml'])
 
     def set_i2c_address(self, args_dict):
         if 'new_i2c_address' not in args_dict:
-            self.logger.error("Cannot set new I2C address without an I2C address")
+            self.logger.error("Missing I2C address")
             return
         try:
             i2c_address = int(str(args_dict['new_i2c_address']), 16)
             write_cmd = "I2C,{}".format(i2c_address)
-            self.logger.info("I2C Change command: {}".format(write_cmd))
-            self.logger.info("Command returned: {}".format(self.atlas_device.query(write_cmd)))
+            if self.interface == 'Bluetooth' and self.bt_serial:
+                self.bt_serial.write((write_cmd + '\r').encode())
+            else:
+                self.atlas_device.query(write_cmd)
             self.atlas_device = None
             self.output_setup = False
-        except:
-            self.logger.exception("Exception changing I2C address")
+        except Exception as e:
+            self.logger.exception("Failed to change I2C address: {}".format(e))
