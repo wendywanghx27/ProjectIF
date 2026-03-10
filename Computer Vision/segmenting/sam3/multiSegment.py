@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+import numpy as np
+import torch
+from dotenv import load_dotenv
+from PIL import Image
+from sam3 import build_sam3_image_model
+from sam3.model.sam3_image_processor import Sam3Processor
+
+
+@dataclass(frozen=True)
+class Config:
+    input_dir: Path
+    mask_output_dir: Path
+    state_file: Path
+    check_interval_seconds: int
+    prompt_text: str
+    log_level: str
+    image_extensions: set[str]
+    device: str
+
+
+def load_config() -> Config:
+    load_dotenv()
+
+    input_dir = os.getenv("INPUT_DIR")
+    output_dir = os.getenv("MASK_OUTPUT_DIR")
+    state_file = os.getenv("STATE_FILE")
+    if not input_dir or not output_dir or not state_file:
+        raise ValueError("INPUT_DIR, MASK_OUTPUT_DIR, and STATE_FILE must be set.")
+
+    interval = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
+    prompt = os.getenv("PROMPT_TEXT", "plant")
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    raw_ext = os.getenv("IMAGE_EXTENSIONS", ".jpg,.jpeg,.png,.bmp,.tif,.tiff")
+    extensions = {e.strip().lower() for e in raw_ext.split(",") if e.strip()}
+    device = os.getenv("DEVICE", "auto").strip().lower()
+
+    return Config(
+        input_dir=Path(input_dir),
+        mask_output_dir=Path(output_dir),
+        state_file=Path(state_file),
+        check_interval_seconds=interval,
+        prompt_text=prompt,
+        log_level=log_level,
+        image_extensions=extensions,
+        device=device,
+    )
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+def validate_runtime(config: Config) -> None:
+    if not config.input_dir.exists() or not config.input_dir.is_dir():
+        raise ValueError(f"INPUT_DIR does not exist or is not a directory: {config.input_dir}")
+
+    config.mask_output_dir.mkdir(parents=True, exist_ok=True)
+    config.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if config.device in {"gpu-required", "cuda-required"} and not torch.cuda.is_available():
+        raise RuntimeError("DEVICE is gpu-required, but CUDA is not available.")
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def load_state(state_file: Path) -> Dict[str, Dict[str, Any]]:
+    if not state_file.exists():
+        return {}
+    try:
+        with state_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.warning("State file unreadable; starting fresh. file=%s error=%s", state_file, exc)
+        return {}
+
+    if not isinstance(data, dict):
+        logging.warning("State file format invalid; starting fresh. file=%s", state_file)
+        return {}
+    return data
+
+
+def atomic_write_json(path: Path, data: Dict[str, Dict[str, Any]]) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    tmp_path.replace(path)
+
+
+def file_signature(path: Path) -> Dict[str, Any]:
+    st = path.stat()
+    return {"mtime_ns": st.st_mtime_ns, "size_bytes": st.st_size}
+
+
+def iter_input_images(input_dir: Path, extensions: set[str]) -> Iterable[Path]:
+    for p in sorted(input_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in extensions:
+            yield p
+
+
+def is_unseen(path: Path, state: Dict[str, Dict[str, Any]]) -> bool:
+    key = str(path.resolve())
+    sig = file_signature(path)
+    prev = state.get(key)
+    return not prev or prev.get("mtime_ns") != sig["mtime_ns"] or prev.get("size_bytes") != sig["size_bytes"]
+
+
+def output_path_for(src: Path, output_dir: Path) -> Path:
+    digest = hashlib.sha1(str(src.resolve()).encode("utf-8")).hexdigest()[:8]
+    return output_dir / f"{src.stem}_{digest}_plant_mask.png"
+
+
+def _collect_arrays(node: Any, target_h: int, target_w: int, out: List[np.ndarray]) -> None:
+    if node is None:
+        return
+
+    if torch.is_tensor(node):
+        arr = node.detach().cpu().numpy()
+        _collect_arrays(arr, target_h, target_w, out)
+        return
+
+    if isinstance(node, np.ndarray):
+        if node.ndim >= 2 and node.shape[-2:] == (target_h, target_w):
+            reshaped = node.reshape(-1, target_h, target_w)
+            out.extend([m for m in reshaped])
+        return
+
+    if isinstance(node, dict):
+        for value in node.values():
+            _collect_arrays(value, target_h, target_w, out)
+        return
+
+    if isinstance(node, (list, tuple)):
+        for value in node:
+            _collect_arrays(value, target_h, target_w, out)
+
+
+def extract_union_mask(inference_state: Any, height: int, width: int) -> np.ndarray:
+    masks: List[np.ndarray] = []
+    _collect_arrays(inference_state, height, width, masks)
+    if not masks:
+        raise RuntimeError("No valid masks found in SAM3 inference state.")
+
+    union_mask = np.zeros((height, width), dtype=bool)
+    for mask in masks:
+        union_mask |= (mask > 0)
+    return union_mask
+
+
+def save_masked_image(src_image: np.ndarray, union_mask: np.ndarray, out_path: Path) -> None:
+    masked = np.zeros_like(src_image)
+    masked[union_mask] = src_image[union_mask]
+    Image.fromarray(masked).save(out_path)
+
+
+def run_pixel_counter(mask_path: Path) -> None:
+    script_path = Path(__file__).resolve().parent / "pixel_count.py"
+    result = subprocess.run(
+        [sys.executable, str(script_path), "--image", str(mask_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout.strip():
+        logging.info("pixel_count: %s", result.stdout.strip())
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "unknown error"
+        raise RuntimeError(f"pixel_count failed for {mask_path}: {stderr}")
+
+
+def process_one_image(
+    image_path: Path,
+    processor: Sam3Processor,
+    prompt_text: str,
+    output_dir: Path,
+) -> Path:
+    with Image.open(image_path) as img:
+        rgb = np.array(img.convert("RGB"))
+        state = processor.set_image(img.convert("RGB"))
+        processor.reset_all_prompts(state)
+        state = processor.set_text_prompt(state=state, prompt=prompt_text)
+        union_mask = extract_union_mask(state, height=rgb.shape[0], width=rgb.shape[1])
+
+    out_path = output_path_for(image_path, output_dir)
+    save_masked_image(rgb, union_mask, out_path)
+    return out_path
+
+
+def run_loop(config: Config, run_once: bool = False) -> None:
+    logging.info("Loading SAM3 model.")
+    model = build_sam3_image_model()
+    processor = Sam3Processor(model, confidence_threshold=0.5)
+    logging.info("SAM3 ready.")
+
+    while True:
+        state = load_state(config.state_file)
+        images = list(iter_input_images(config.input_dir, config.image_extensions))
+        new_images = [p for p in images if is_unseen(p, state)]
+
+        logging.info(
+            "Scan complete. total_images=%d new_or_modified=%d",
+            len(images),
+            len(new_images),
+        )
+
+        for image_path in new_images:
+            key = str(image_path.resolve())
+            try:
+                logging.info("Processing image=%s prompt=%s", image_path, config.prompt_text)
+                out_path = process_one_image(
+                    image_path=image_path,
+                    processor=processor,
+                    prompt_text=config.prompt_text,
+                    output_dir=config.mask_output_dir,
+                )
+                logging.info("Mask written output=%s", out_path)
+                run_pixel_counter(out_path)
+                state[key] = {
+                    **file_signature(image_path),
+                    "output_path": str(out_path.resolve()),
+                    "processed_at": datetime.now(timezone.utc).isoformat(),
+                }
+                atomic_write_json(config.state_file, state)
+            except Exception as exc:
+                logging.exception("Failed processing image=%s error=%s", image_path, exc)
+
+        if run_once:
+            return
+        logging.info("Sleeping for %d seconds", config.check_interval_seconds)
+        time.sleep(config.check_interval_seconds)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Hourly SAM3 plant segmentation pipeline.")
+    parser.add_argument("--run-once", action="store_true", help="Process once and exit.")
+    args = parser.parse_args()
+
+    try:
+        config = load_config()
+        configure_logging(config.log_level)
+        validate_runtime(config)
+    except Exception as exc:
+        print(f"Startup validation failed: {exc}", file=sys.stderr)
+        return 1
+
+    logging.info(
+        "Pipeline config input_dir=%s output_dir=%s state_file=%s interval=%d prompt=%s device=%s",
+        config.input_dir,
+        config.mask_output_dir,
+        config.state_file,
+        config.check_interval_seconds,
+        config.prompt_text,
+        config.device,
+    )
+
+    try:
+        run_loop(config=config, run_once=args.run_once)
+    except KeyboardInterrupt:
+        logging.info("Interrupted; shutting down.")
+    except Exception as exc:
+        logging.exception("Pipeline crashed: %s", exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

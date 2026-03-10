@@ -1,0 +1,22 @@
+services:
+  sam3-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      INPUT_DIR: /data/input
+      MASK_OUTPUT_DIR: /data/output
+      STATE_FILE: /data/state/processed_state.json
+    volumes:
+      - ${INPUT_DIR_HOST}:/data/input:ro
+      - ${MASK_OUTPUT_DIR_HOST}:/data/output
+      - ${STATE_DIR_HOST}:/data/state
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
