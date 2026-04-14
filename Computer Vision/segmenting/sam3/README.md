@@ -22,7 +22,7 @@ Run the Pi setup script once on the Raspberry Pi:
 bash "Computer Vision/pi/setup_pi_capture_share.sh"
 ```
 
-That script installs Samba, creates `/pic_shared`, installs a recurring capture script, and enables the systemd timer that writes timestamped image batches into the shared folder. The Pi capture path is Debian-friendly and uses `rpicam-still` or `libcamera-still` instead of ROS Noetic packages.
+That script installs Samba, creates `/pic_shared`, installs a recurring capture script, and enables the systemd timer that writes timestamped image batches into the shared folder. The Pi capture path is Debian-friendly and grabs a still image from the Astra's V4L2 device using `ffmpeg` or `fswebcam`.
 
 ## Run on the computer with Docker Compose
 1. Copy `.env.example` to `.env`.

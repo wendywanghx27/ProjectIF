@@ -27,7 +27,9 @@ DISTRO_CODENAME="$(lsb_release -sc)"
 apt-get update
 apt-get install -y \
   curl gnupg2 ca-certificates lsb-release \
-  samba samba-common-bin
+  samba samba-common-bin ffmpeg v4l-utils fswebcam
+
+usermod -aG video "$PI_USER"
 
 mkdir -p "$CAPTURE_ROOT"
 chmod 1777 "$SHARE_PATH"
@@ -59,7 +61,10 @@ PI_USER=$PI_USER
 CAPTURE_ROOT=$CAPTURE_ROOT
 CAPTURE_COMMAND=auto
 IMAGE_BASENAME=capture
-RPICAM_ARGS=--timeout 2000 --nopreview
+VIDEO_DEVICE=/dev/video0
+VIDEO_SIZE=1280x720
+VIDEO_INPUT_FORMAT=mjpeg
+FFMPEG_EXTRA_ARGS=
 EOF
 
 cat > "$SERVICE_PATH" <<EOF
@@ -99,5 +104,6 @@ Next steps:
 1. Inspect the timer with: systemctl status projectif-capture.timer
 2. Trigger an immediate capture with: systemctl start projectif-capture.service
 3. Confirm the share is exported with: smbclient -L localhost -U $PI_USER
-4. If capture fails, install a Pi camera tool that provides rpicam-still or libcamera-still.
+4. Log out and back in so the $PI_USER video-group membership is refreshed.
+5. If needed, set VIDEO_DEVICE in $ENV_PATH to a different /dev/videoN node and rerun the service.
 EOF
