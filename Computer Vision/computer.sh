@@ -1,11 +1,9 @@
-# Pull images to computer (just use python?)
+#!/bin/bash
+set -euo pipefail
 
-sudo apt install inotify-tools
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Should watch for latest image and allow script to run
-inotifywait -m -e create --format '%f' "/pic_shared" | while read NEWFILE
-do
-    image_path = "pic_shared/$NEWFILE"
-    # Run a python script here? (run sam3 on image file)
-    
-done
+echo "The computer-side flow is now Docker Compose based."
+echo "From the sam3 directory run:"
+echo "  cd \"$SCRIPT_DIR/segmenting/sam3\""
+echo "  docker compose up --build"

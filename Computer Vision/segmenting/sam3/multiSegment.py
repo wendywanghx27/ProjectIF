@@ -26,6 +26,7 @@ class Config:
     mask_output_dir: Path
     state_file: Path
     check_interval_seconds: int
+    file_stable_seconds: int
     prompt_text: str
     log_level: str
     image_extensions: set[str]
@@ -42,6 +43,7 @@ def load_config() -> Config:
         raise ValueError("INPUT_DIR, MASK_OUTPUT_DIR, and STATE_FILE must be set.")
 
     interval = int(os.getenv("CHECK_INTERVAL_SECONDS", "3600"))
+    file_stable_seconds = int(os.getenv("FILE_STABLE_SECONDS", "30"))
     prompt = os.getenv("PROMPT_TEXT", "plant")
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     raw_ext = os.getenv("IMAGE_EXTENSIONS", ".jpg,.jpeg,.png,.bmp,.tif,.tiff")
@@ -53,6 +55,7 @@ def load_config() -> Config:
         mask_output_dir=Path(output_dir),
         state_file=Path(state_file),
         check_interval_seconds=interval,
+        file_stable_seconds=file_stable_seconds,
         prompt_text=prompt,
         log_level=log_level,
         image_extensions=extensions,
@@ -111,9 +114,12 @@ def file_signature(path: Path) -> Dict[str, Any]:
 
 
 def iter_input_images(input_dir: Path, extensions: set[str]) -> Iterable[Path]:
-    for p in sorted(input_dir.iterdir()):
-        if p.is_file() and p.suffix.lower() in extensions:
-            yield p
+    for p in sorted(input_dir.rglob("*")):
+        try:
+            if p.is_file() and p.suffix.lower() in extensions:
+                yield p
+        except FileNotFoundError:
+            logging.info("Skipping path that disappeared during scan path=%s", p)
 
 
 def is_unseen(path: Path, state: Dict[str, Dict[str, Any]]) -> bool:
@@ -121,6 +127,20 @@ def is_unseen(path: Path, state: Dict[str, Dict[str, Any]]) -> bool:
     sig = file_signature(path)
     prev = state.get(key)
     return not prev or prev.get("mtime_ns") != sig["mtime_ns"] or prev.get("size_bytes") != sig["size_bytes"]
+
+
+def is_stable(path: Path, stable_seconds: int) -> bool:
+    sig_before = file_signature(path)
+    if stable_seconds <= 0:
+        return True
+
+    time.sleep(stable_seconds)
+    try:
+        sig_after = file_signature(path)
+    except FileNotFoundError:
+        logging.info("File disappeared before stability check completed image=%s", path)
+        return False
+    return sig_before == sig_after
 
 
 def output_path_for(src: Path, output_dir: Path) -> Path:
@@ -224,6 +244,13 @@ def run_loop(config: Config, run_once: bool = False) -> None:
         for image_path in new_images:
             key = str(image_path.resolve())
             try:
+                if not is_stable(image_path, config.file_stable_seconds):
+                    logging.info(
+                        "Skipping unstable image for now image=%s stable_seconds=%d",
+                        image_path,
+                        config.file_stable_seconds,
+                    )
+                    continue
                 logging.info("Processing image=%s prompt=%s", image_path, config.prompt_text)
                 out_path = process_one_image(
                     image_path=image_path,
@@ -262,11 +289,12 @@ def main() -> int:
         return 1
 
     logging.info(
-        "Pipeline config input_dir=%s output_dir=%s state_file=%s interval=%d prompt=%s device=%s",
+        "Pipeline config input_dir=%s output_dir=%s state_file=%s interval=%d stable_seconds=%d prompt=%s device=%s",
         config.input_dir,
         config.mask_output_dir,
         config.state_file,
         config.check_interval_seconds,
+        config.file_stable_seconds,
         config.prompt_text,
         config.device,
     )

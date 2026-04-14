@@ -10,7 +10,7 @@ services:
       MASK_OUTPUT_DIR: /data/output
       STATE_FILE: /data/state/processed_state.json
     volumes:
-      - ${INPUT_DIR_HOST}:/data/input:ro
+      - pi-input:/data/input:ro
       - ${MASK_OUTPUT_DIR_HOST}:/data/output
       - ${STATE_DIR_HOST}:/data/state
     restart: unless-stopped
@@ -20,3 +20,11 @@ services:
           devices:
             - driver: nvidia
               capabilities: [gpu]
+
+volumes:
+  pi-input:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: username=${PI_SHARE_USER},password=${PI_SHARE_PASSWORD},vers=${PI_SHARE_VERS},ro,file_mode=0444,dir_mode=0555
+      device: "//${PI_SHARE_HOST}/${PI_SHARE_NAME}"
