@@ -20,8 +20,36 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+if ! command -v lsb_release >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y lsb-release curl gnupg2 ca-certificates
+fi
+
+DISTRO_ID="$(lsb_release -is)"
+DISTRO_CODENAME="$(lsb_release -sc)"
+
+if [ "$DISTRO_ID" != "Ubuntu" ] || [ "$DISTRO_CODENAME" != "focal" ]; then
+  cat >&2 <<EOF
+This setup script currently expects Ubuntu 20.04 (Focal) with ROS Noetic packages.
+Detected: $DISTRO_ID $DISTRO_CODENAME
+
+ROS Noetic apt packages such as ros-noetic-image-geometry are not generally available on other base distros.
+Use Ubuntu 20.04 on the Pi, or switch this setup to a source-build / different ROS distribution.
+EOF
+  exit 1
+fi
+
+if [ ! -f /etc/apt/sources.list.d/ros1-latest.list ]; then
+  echo "Adding ROS apt repository for Ubuntu Focal."
+  curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc \
+    | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg
+  echo "deb [signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros/ubuntu $DISTRO_CODENAME main" \
+    > /etc/apt/sources.list.d/ros1-latest.list
+fi
+
 apt-get update
 apt-get install -y \
+  curl gnupg2 ca-certificates lsb-release \
   samba samba-common-bin inotify-tools git cmake build-essential \
   libusb-1.0-0-dev libeigen3-dev libgflags-dev libdw-dev \
   "ros-$ROS_DISTRO-image-geometry" \
